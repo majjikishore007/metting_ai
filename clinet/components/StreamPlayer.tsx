@@ -1,10 +1,9 @@
 import React from 'react';
 import { Button } from './ui/button';
-import { FaMicrophone, FaStop } from 'react-icons/fa';
+import { FaStop } from 'react-icons/fa';
 import { IoMdMic, IoMdMicOff } from 'react-icons/io';
 import { FiCamera, FiCameraOff } from 'react-icons/fi';
 import { CiStop1 } from 'react-icons/ci';
-import { AppData, Producer } from 'mediasoup-client/types';
 
 interface StreamPlayerProps {
   videoRef: React.RefObject<HTMLVideoElement | null>;

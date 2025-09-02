@@ -75,12 +75,20 @@ const createWebRtcTransport = async (
     });
 
     console.log(`Informing peer ${socket.id} about existing producers...`);
-    const allProducerIds: string[] = [];
+    const allProducerIds: {
+      producerId: string;
+      peerId: string;
+      kind: string;
+    }[] = [];
     peers.forEach((peer, peerId) => {
       // Don't send a peer its own producers
       if (peerId !== socket.id) {
         peer.producers.forEach((producer) => {
-          allProducerIds.push(producer.id);
+          allProducerIds.push({
+            producerId: producer.id,
+            peerId,
+            kind: producer.kind,
+          });
         });
       }
     });
@@ -148,10 +156,24 @@ const createWebRtcTransport = async (
             console.log('Transport got closed', producer.id);
             producer.close();
             peers.get(socket.id).producers.delete(producer.id);
+
+            socket.broadcast.emit('producer-closed', {
+              producerId: producer.id,
+            });
           });
 
+          producer.on('@close', () => {
+            console.log('Producer-Closed', producer.id);
+            socket.broadcast.emit('producer-closed', {
+              producerId: producer.id,
+            });
+          });
           // inform all the other peers
-          socket.broadcast.emit('new-producer', { producerId: producer.id });
+          socket.broadcast.emit('new-producer', {
+            producerId: producer.id,
+            peerId: socket.id,
+            kind,
+          });
 
           callback({
             id: producer.id,
@@ -226,11 +248,24 @@ const createWebRtcTransport = async (
     socket.on('disconnect', () => {
       // do cleanup
       console.log('User got disconnected', socket.id);
-      peers
-        .get(socket.id)
-        ?.tranports.forEach((transport: Transport) => transport.close());
+      const peer = peers.get(socket.id);
 
-      peers.delete(socket.id);
+      if (peer) {
+        peer.producers.forEach((producer) => {
+          producer.close();
+          io.emit('producer-closed', { producerId: producer.id });
+        });
+
+        peer.consumer.forEach((consumer) => {
+          consumer.close();
+        });
+
+        peer.tranports.forEach((transport) => {
+          transport.close();
+        });
+        socket.broadcast.emit('peer-left', { peerId: socket.id });
+        peers.delete(socket.id);
+      }
     });
   });
 

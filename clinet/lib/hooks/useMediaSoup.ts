@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import * as mediaSoup from 'mediasoup-client';
 import { io, Socket } from 'socket.io-client';
 import {
@@ -8,23 +8,38 @@ import {
   Transport,
 } from 'mediasoup-client/types';
 
+interface ConsumersMap {
+  peerId: string;
+  producerId: string;
+  consumer: Consumer;
+}
+
+interface RemotePeers {
+  videoConsumerId?: string;
+  audioConsumerId?: string;
+  stream: MediaStream;
+}
+
 export const useMediaSoup = () => {
-  const [device, setDevice] = useState<mediaSoup.Device | null>(null);
-  const [socket, setSocket] = useState<Socket | null>(null);
-  const [producerTransport, setProducerTransport] = useState<Transport | null>(
-    null
+  // non reactive state
+
+  const deviceRef = useRef<mediaSoup.Device | null>(null);
+  const socketRef = useRef<Socket | null>(null);
+  const producerTransportRef = useRef<Transport>(null);
+  const consumerTransportRef = useRef<Transport>(null);
+  const videoProducerRef = useRef<Producer | null>(null);
+  const audioProducerRef = useRef<Producer | null>(null);
+
+  const [consumers, setConsumers] = useState<Map<string, ConsumersMap>>(
+    new Map()
   );
-  const [consumerTransport, setConsumerTransport] = useState<Transport | null>(
-    null
-  );
-  const [videoProducer, setVideoProducer] = useState<Producer | null>(null);
-  const [audioProducer, setAudioProducer] = useState<Producer | null>(null);
-  const [consumers, setConsumers] = useState<Map<string, Consumer>>(new Map());
-  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null); // ADDED: State for remote stream
+  const [remotePeers, setRemotePeers] = useState<Map<string, RemotePeers>>(
+    new Map()
+  ); // New: per-peer state
   const [isInitialized, setIsInitialized] = useState(false);
 
   // connect to the socket
-  const initSocket = () => {
+  const initSocket = async () => {
     console.log('Connecting to socket.io...');
     try {
       const newSocket = io('http://localhost:8080');
@@ -34,8 +49,7 @@ export const useMediaSoup = () => {
       newSocket.on('disconnect', () => {
         console.log('Socket disconnected');
       });
-      setSocket(newSocket);
-      return newSocket;
+      socketRef.current = newSocket;
     } catch (error) {
       console.error('Error connecting to socket:', error);
     }
@@ -46,18 +60,18 @@ export const useMediaSoup = () => {
     console.log('Creating MediaSoup device...');
     try {
       const newDevice = new mediaSoup.Device();
-      setDevice(newDevice);
-      return newDevice;
+      deviceRef.current = newDevice;
+      console.log('Created NewDevice');
     } catch (error) {
       console.error('Error creating MediaSoup device:', error);
     }
   };
 
   // get router capabilities
-  const getRouterRtpCapabilities = async (socket: Socket) => {
-    console.log('Get router rtpCapabilites ', socket.id);
-
+  const getRouterRtpCapabilities = async () => {
     try {
+      const socket = socketRef.current;
+
       const routerRtpCapabilities = await new Promise<RtpCapabilities>(
         (resolve, reject) => {
           const timeout = setTimeout(() => {
@@ -73,19 +87,23 @@ export const useMediaSoup = () => {
           );
         }
       );
-      console.log('Router RTP capabilities:', routerRtpCapabilities);
-      return routerRtpCapabilities;
+      console.log(
+        `PeerId ${socket?.id} Router RTP capabilities ${routerRtpCapabilities}`
+      );
+      console.log('Load rtpCapabilites for the device');
+      deviceRef.current?.load({ routerRtpCapabilities });
     } catch (err) {
       console.error('Error getting router RTP capabilities:', err);
     }
   };
 
-  const createSendTransport = async (
-    socket: Socket,
-    device: mediaSoup.Device
-  ) => {
+  const createSendTransport = async () => {
     try {
-      console.log('Create send Transport ', socket.id);
+      const socket = socketRef.current;
+      const device = deviceRef.current;
+      if (!socket || !device) {
+        throw new Error('Socket or device not found');
+      }
 
       const transportInfo = await new Promise<any>((resolve, reject) => {
         socket.emit('create-transport', (data: any) => {
@@ -97,8 +115,10 @@ export const useMediaSoup = () => {
         });
       });
       const transport = device.createSendTransport(transportInfo);
-      console.log('Producer transport created:', transport.id);
-      setProducerTransport(transport);
+      console.log(
+        `Send Transport created for PeerId :${socket.id} TransprotId:${transport.id}`
+      );
+      producerTransportRef.current = transport;
 
       // Handle transport connect event
       transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
@@ -160,59 +180,45 @@ export const useMediaSoup = () => {
 
   // Create producer for a specific track
   const createProducer = async (track: MediaStreamTrack) => {
-    if (!producerTransport) {
-      throw new Error('Producer transport not available');
-    }
+    const transport = producerTransportRef.current;
+    if (!transport) throw new Error('Producer transport not available');
 
-    try {
-      const producer = await producerTransport.produce({
-        track,
-        encodings:
-          track.kind === 'video'
-            ? [
-                { maxBitrate: 100000 },
-                { maxBitrate: 300000 },
-                { maxBitrate: 900000 },
-              ]
-            : undefined,
-        codecOptions: {
-          videoGoogleStartBitrate: 1000,
-        },
-      });
+    const producer = await transport.produce({
+      track,
+      encodings:
+        track.kind === 'video'
+          ? [
+              { maxBitrate: 100000 },
+              { maxBitrate: 300000 },
+              { maxBitrate: 900000 },
+            ]
+          : undefined,
+      codecOptions: { videoGoogleStartBitrate: 1000 },
+    });
+    console.log(
+      `PId ${socketRef.current?.id}, PT ${transport.id}, ${track.kind} producer created: ${producer.id}`
+    );
 
-      console.log(`${track.kind} producer created:`, producer.id);
+    if (track.kind === 'video') videoProducerRef.current = producer;
+    else if (track.kind === 'audio') audioProducerRef.current = producer;
 
-      if (track.kind === 'video') {
-        setVideoProducer(producer);
-      } else if (track.kind === 'audio') {
-        setAudioProducer(producer);
-      }
+    producer.on('transportclose', () =>
+      console.log(`${track.kind} producer transport closed`)
+    );
+    producer.on('trackended', () =>
+      console.log(`${track.kind} producer track ended`)
+    );
 
-      // Handle producer events
-      producer.on('transportclose', () => {
-        console.log(`${track.kind} producer transport closed`);
-      });
-
-      producer.on('trackended', () => {
-        console.log(`${track.kind} producer track ended`);
-      });
-
-      return producer;
-    } catch (error) {
-      console.error(`Error creating ${track.kind} producer:`, error);
-      throw error;
-    }
+    return producer;
   };
 
   // Start producing from a MediaStream
   const startProducing = async (stream: MediaStream) => {
-    console.log('start producing', producerTransport?.id);
-
-    if (!producerTransport) {
-      throw new Error('Producer transport not ready');
-    }
-
     try {
+      console.log(
+        `Creating producers for peer ${socketRef.current?.id} PT ${producerTransportRef.current?.id}`
+      );
+
       const producers: Producer[] = [];
 
       // Get video tracks
@@ -240,13 +246,13 @@ export const useMediaSoup = () => {
   // Stop all producers
   const stopProducing = async () => {
     try {
-      if (videoProducer) {
-        videoProducer.close();
-        setVideoProducer(null);
+      if (videoProducerRef.current) {
+        videoProducerRef.current.close();
+        videoProducerRef.current = null;
       }
-      if (audioProducer) {
-        audioProducer.close();
-        setAudioProducer(null);
+      if (audioProducerRef.current) {
+        audioProducerRef.current.close();
+        audioProducerRef.current = null;
       }
       console.log('All producers stopped');
     } catch (error) {
@@ -254,66 +260,75 @@ export const useMediaSoup = () => {
     }
   };
 
-  const createReciveTransport = async (
-    socket: Socket,
-    device: mediaSoup.Device
-  ) => {
-    console.log('Create Recive transport', socket.id);
+  const createReciveTransport = async () => {
+    try {
+      const socket = socketRef.current;
+      const device = deviceRef.current;
+      if (!socket || !device) {
+        throw new Error('Socket or device not found');
+      }
+      const transportInfo = await new Promise<any>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Timeout creating recive transport'));
+        }, 10000);
+        socket.emit('create-transport', (data: any) => {
+          clearTimeout(timeout);
+          if (data.error) {
+            reject(data.error);
+          } else {
+            resolve(data);
+          }
+        });
+      });
 
-    const transportInfo = await new Promise<any>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('Timeout creating recive transport'));
-      }, 10000);
-      socket.emit('create-transport', (data: any) => {
-        clearTimeout(timeout);
-        if (data.error) {
-          reject(data.error);
-        } else {
-          resolve(data);
+      const transport = device.createRecvTransport(transportInfo);
+      console.log(
+        `Recive Transport created for PeerId :${socket.id} TransprotId:${transport.id}`
+      );
+      consumerTransportRef.current = transport;
+
+      transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+        try {
+          socket.emit(
+            'connect-transport',
+            {
+              transportId: transport.id,
+              dtlsParameters,
+            },
+            (response: any) => {
+              if (response.error) {
+                console.error('Transport connect error:', response.error);
+                errback(response.error);
+              } else {
+                console.log('Transport connected successfully');
+                callback();
+              }
+            }
+          );
+        } catch (error) {
+          console.error('Error in conncting the reciver traport', error);
         }
       });
-    });
-
-    const transport = device.createRecvTransport(transportInfo);
-    console.log('Created recive transport', transport.id);
-    setConsumerTransport(transport);
-
-    transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
-      try {
-        socket.emit(
-          'connect-transport',
-          {
-            transportId: transport.id,
-            dtlsParameters,
-          },
-          (response: any) => {
-            if (response.error) {
-              console.error('Transport connect error:', response.error);
-              errback(response.error);
-            } else {
-              console.log('Transport connected successfully');
-              callback();
-            }
-          }
-        );
-      } catch (error) {
-        console.error('Error in conncting the reciver traport', error);
-      }
-    });
-    return transport;
+      return transport;
+    } catch (error) {
+      console.error('Error in create Recive Transport', error);
+    }
   };
 
   const consumeStream = async (
-    device: mediaSoup.Device,
-    socket: Socket,
-    consumerTransport: Transport,
-    producerId: string
+    producerId: string,
+    peerId: string,
+    kind: string
   ) => {
-    if (!device || !consumerTransport || !socket) {
-      return;
-    }
     try {
+      const socket = socketRef.current;
+      const device = deviceRef.current;
+      const consumerTransport = consumerTransportRef.current;
+
       console.log('Consuming media for producer:', producerId);
+      if (!socket || !device || !consumerTransport) {
+        return;
+      }
       const { rtpCapabilities } = device;
 
       const consumerParams = await new Promise<any>((resolve, reject) => {
@@ -328,7 +343,6 @@ export const useMediaSoup = () => {
             if (params.error) {
               reject(params.error);
             } else {
-              // Add debug logging for consumer parameters
               console.log('Consumer parameters received:', {
                 id: params.id,
                 kind: params.kind,
@@ -342,7 +356,6 @@ export const useMediaSoup = () => {
 
       const consumer = await consumerTransport.consume(consumerParams);
 
-      // Add detailed logging for the consumer
       console.log('Consumer created:', {
         id: consumer.id,
         kind: consumer.kind,
@@ -352,22 +365,10 @@ export const useMediaSoup = () => {
           readyState: consumer.track.readyState,
         },
       });
-
+      // store peerId and producerIds
       setConsumers((prev) => {
         const updated = new Map(prev);
-        updated.set(consumer.id, consumer);
-
-        // Log the state of all consumers
-        console.log('Updated consumers:', {
-          total: updated.size,
-          videoTracks: Array.from(updated.values()).filter(
-            (c) => c.kind === 'video'
-          ).length,
-          audioTracks: Array.from(updated.values()).filter(
-            (c) => c.kind === 'audio'
-          ).length,
-        });
-
+        updated.set(consumer.id, { consumer, peerId, producerId });
         return updated;
       });
 
@@ -412,74 +413,138 @@ export const useMediaSoup = () => {
           return updated;
         });
       });
+
+      updatePeerStream(peerId, consumer, kind);
     } catch (error) {
       console.error('Error consuming stream:', error);
     }
   };
 
+  const removeConsumer = (consumerId: string) => {
+    setConsumers((prev) => {
+      const consumerData = prev.get(consumerId);
+      if (consumerData) {
+        consumerData.consumer.close();
+
+        // Update peer stream
+        updatePeerStream(consumerData.peerId, null, consumerData.consumer.kind);
+      }
+      const updated = new Map(prev);
+      updated.delete(consumerId);
+      return updated;
+    });
+  };
+
+  const updatePeerStream = (
+    peerId: string,
+    consumer: Consumer | null,
+    kind: string
+  ) => {
+    setRemotePeers((prev) => {
+      const updated = new Map(prev);
+      let peer = updated.get(peerId) || { stream: new MediaStream() };
+
+      if (consumer) {
+        // Add track if live
+        if (consumer.track.readyState === 'live') {
+          peer.stream.addTrack(consumer.track);
+          if (kind === 'video') {
+            peer.videoConsumerId = consumer.id;
+          } else if (kind === 'audio') {
+            peer.audioConsumerId = consumer.id;
+          }
+          console.log(`Added ${kind} track to peer ${peerId} stream`);
+        }
+      } else {
+        // Remove track (consumer is null on removal)
+        const tracks = peer.stream.getTracks();
+        const trackToRemove = tracks.find((t) => t.kind === kind);
+        if (trackToRemove) {
+          peer.stream.removeTrack(trackToRemove);
+          console.log(`Removed ${kind} track from peer ${peerId} stream`);
+        }
+        if (kind === 'video') {
+          delete peer.videoConsumerId;
+        } else if (kind === 'audio') {
+          delete peer.audioConsumerId;
+        }
+        // If no consumers left, remove peer
+        if (!peer.videoConsumerId && !peer.audioConsumerId) {
+          updated.delete(peerId);
+          console.log(`Removed peer ${peerId} as no consumers left`);
+          return updated;
+        }
+      }
+
+      updated.set(peerId, peer);
+      return updated;
+    });
+  };
+
   // Initialize everything
   const init = async () => {
     try {
-      console.log('Initializing MediaSoup...');
-
       // init socket
-      const newSocket = initSocket();
-      if (!newSocket) {
-        throw new Error('Failed to initialize socket');
+      await initSocket();
+      const socket = socketRef.current;
+
+      if (!socket) {
+        throw new Error('Socket Cration Failed');
       }
-
-      // Wait for socket connection
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          reject(new Error('Socket connection timeout'));
-        }, 10000);
-
-        if (newSocket.connected) {
-          clearTimeout(timeout);
-          resolve();
-        } else {
-          newSocket.on('connect', () => {
-            clearTimeout(timeout);
-            resolve();
-          });
-        }
-      });
-
-      // init device
-      const newDevice = await initDevice();
-      if (!newDevice) {
-        throw new Error('Failed to initialize device');
+      await initDevice();
+      if (!deviceRef) {
+        throw new Error('Device Creation Failed');
       }
-
       // get router RtpCapabilities
-      const routerRtpCapabilities = await getRouterRtpCapabilities(newSocket);
-      if (!routerRtpCapabilities) {
-        throw new Error('Failed to get router RTP capabilities');
-      }
+      await getRouterRtpCapabilities();
+      await createSendTransport();
+      await createReciveTransport();
 
-      // load device with router capabilities
-      await newDevice.load({ routerRtpCapabilities });
-      console.log('Device loaded with RTP capabilities');
-
-      // create producer transport
-      await createSendTransport(newSocket, newDevice);
-      const newConsumerTransport = await createReciveTransport(
-        newSocket,
-        newDevice
-      );
-
-      newSocket.on('existing-producers', ({ producerIds }) => {
+      socketRef.current?.on('existing-producers', ({ producerIds }) => {
         console.log(`Received ${producerIds.length} existing producers.`);
-        for (const producerId of producerIds) {
-          consumeStream(newDevice, newSocket, newConsumerTransport, producerId);
+        for (const { producerId, peerId, kind } of producerIds) {
+          consumeStream(producerId, peerId, kind);
         }
       });
 
       // listner for the server boardcast event
-      newSocket.on('new-producer', ({ producerId }) => {
-        console.log('New producer available ', producerId);
-        consumeStream(newDevice, newSocket, newConsumerTransport, producerId);
+      socketRef.current?.on('new-producer', ({ producerId, peerId, kind }) => {
+        console.log(
+          'New producer available ',
+          producerId,
+          'from peer',
+          peerId,
+          'kind',
+          kind
+        );
+        consumeStream(producerId, peerId, kind);
       });
+
+      socket.on('producer-closed', ({ producerId }) => {
+        console.log('Producer closed notification:', producerId);
+      });
+
+      // handle peer-left
+      socket.on('peer-left', ({ peerId }) => {
+        console.log('Peer left:', peerId);
+        setRemotePeers((prev) => {
+          const updated = new Map(prev);
+          updated.delete(peerId);
+          return updated;
+        });
+        // Also clean any lingering consumers for this peer
+        setConsumers((prev) => {
+          const updated = new Map(prev);
+          prev.forEach((data, cid) => {
+            if (data.peerId === peerId) {
+              data.consumer.close();
+              updated.delete(cid);
+            }
+          });
+          return updated;
+        });
+      });
+
       setIsInitialized(true);
       console.log('MediaSoup initialization complete');
     } catch (error) {
@@ -489,71 +554,15 @@ export const useMediaSoup = () => {
   };
 
   useEffect(() => {
-    console.log('Setting up remote stream, consumers:', consumers.size);
-
-    if (consumers.size === 0) {
-      setRemoteStream(null);
-      return;
-    }
-
-    try {
-      const newStream = new MediaStream();
-      let videoTracksAdded = 0;
-      let audioTracksAdded = 0;
-
-      consumers.forEach((consumer) => {
-        if (consumer.track.readyState === 'live') {
-          try {
-            newStream.addTrack(consumer.track);
-            if (consumer.kind === 'video') {
-              videoTracksAdded++;
-              console.log('Added video track:', {
-                id: consumer.track.id,
-                enabled: consumer.track.enabled,
-                readyState: consumer.track.readyState,
-                constraints: consumer.track.getConstraints(),
-              });
-            } else if (consumer.kind === 'audio') {
-              audioTracksAdded++;
-            }
-          } catch (e) {
-            console.error('Error adding track to stream:', e);
-          }
-        } else {
-          console.warn('Track not live:', {
-            kind: consumer.kind,
-            readyState: consumer.track.readyState,
-          });
-        }
-      });
-
-      console.log('New remote stream created:', {
-        id: newStream.id,
-        videoTracks: videoTracksAdded,
-        audioTracks: audioTracksAdded,
-        totalTracks: newStream.getTracks().length,
-      });
-
-      if (newStream.getTracks().length > 0) {
-        setRemoteStream(newStream);
-      }
-    } catch (error) {
-      console.error('Error creating remote stream:', error);
-    }
-  }, [consumers]);
-
-  useEffect(() => {
     init();
 
     return () => {
       // Cleanup logic
-      if (socket) {
-        socket.disconnect();
-      }
-      videoProducer?.close();
-      audioProducer?.close();
-      producerTransport?.close();
-      consumerTransport?.close();
+      socketRef.current?.disconnect();
+      videoProducerRef.current?.close();
+      audioProducerRef.current?.close();
+      producerTransportRef.current?.close();
+      consumerTransportRef.current?.close();
     };
   }, []); // Ensure this runs only once
 
@@ -561,6 +570,8 @@ export const useMediaSoup = () => {
     isInitialized,
     startProducing,
     stopProducing,
-    remoteStream,
+    remoteStreams: Array.from(remotePeers.entries()).map(
+      ([peerId, { stream }]) => ({ peerId, stream })
+    ),
   };
 };
