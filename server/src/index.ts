@@ -74,29 +74,37 @@ const createWebRtcTransport = async (
       consumer: new Map(),
     });
 
-    console.log(`Informing peer ${socket.id} about existing producers...`);
-    const allProducerIds: {
-      producerId: string;
-      peerId: string;
-      kind: string;
-    }[] = [];
-    peers.forEach((peer, peerId) => {
-      // Don't send a peer its own producers
-      if (peerId !== socket.id) {
-        peer.producers.forEach((producer) => {
-          allProducerIds.push({
-            producerId: producer.id,
-            peerId,
-            kind: producer.kind,
-          });
+    socket.on('get-existing-producers', (callback) => {
+      try {
+        console.log(`Informing peer ${socket.id} about existing producers...`);
+        const allProducerIds: {
+          producerId: string;
+          peerId: string;
+          kind: string;
+        }[] = [];
+        peers.forEach((peer, peerId) => {
+          // Don't send a peer its own producers
+          if (peerId !== socket.id) {
+            peer.producers.forEach((producer) => {
+              allProducerIds.push({
+                producerId: producer.id,
+                peerId,
+                kind: producer.kind,
+              });
+            });
+          }
         });
+        callback({ producerIds: allProducerIds });
+      } catch (error) {
+        console.error('error in getting the existing producers', error);
       }
     });
+
     // Use a specific event for this initial list
-    socket.emit('existing-producers', { producerIds: allProducerIds });
-    console.log(
-      `Sent ${allProducerIds.length} existing producer IDs to ${socket.id}`
-    );
+    // socket.emit('existing-producers', { producerIds: allProducerIds });
+    // console.log(
+    //   `Sent ${allProducerIds.length} existing producer IDs to ${socket.id}`
+    // );
 
     // get router-rtp-capabalites
     socket.on('get-router-rtp-capabilites', (callback) => {

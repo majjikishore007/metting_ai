@@ -41,30 +41,35 @@ export const useMediaSoup = () => {
   // connect to the socket
   const initSocket = async () => {
     console.log('Connecting to socket.io...');
-    try {
-      const newSocket = io('http://localhost:8080');
-      newSocket.on('connect', () => {
-        console.log('Connected to socket.io server:', newSocket.id);
-      });
-      newSocket.on('disconnect', () => {
-        console.log('Socket disconnected');
-      });
-      socketRef.current = newSocket;
-    } catch (error) {
-      console.error('Error connecting to socket:', error);
-    }
+    await new Promise<Socket>((resolve, reject) => {
+      try {
+        const newSocket = io('http://localhost:8080');
+        newSocket.on('connect', () => {
+          console.log('Connected to socket.io server:', newSocket.id);
+        });
+        socketRef.current = newSocket;
+        resolve(socketRef.current);
+      } catch (error) {
+        console.error('Error connecting to socket:', error);
+        reject({ error });
+      }
+    });
   };
 
   // create Device
   const initDevice = async () => {
     console.log('Creating MediaSoup device...');
-    try {
-      const newDevice = new mediaSoup.Device();
-      deviceRef.current = newDevice;
-      console.log('Created NewDevice');
-    } catch (error) {
-      console.error('Error creating MediaSoup device:', error);
-    }
+    await new Promise<mediaSoup.Device>((resolve, reject) => {
+      try {
+        const newDevice = new mediaSoup.Device();
+        deviceRef.current = newDevice;
+        console.log('Created NewDevice');
+        resolve(deviceRef.current);
+      } catch (error) {
+        console.error('Error creating MediaSoup device:', error);
+        reject({ error });
+      }
+    });
   };
 
   // get router capabilities
@@ -121,7 +126,7 @@ export const useMediaSoup = () => {
       producerTransportRef.current = transport;
 
       // Handle transport connect event
-      transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+      transport.on('connect', ({ dtlsParameters }, callback, errback) => {
         try {
           console.log('Triggere Transport connect event');
           socket.emit(
@@ -142,11 +147,12 @@ export const useMediaSoup = () => {
           );
         } catch (error) {
           console.error('Error in transport connect:', error);
+          errback(new Error('Error in connecting the Transport'));
         }
       });
 
       // Handle produce event
-      transport.on('produce', async (parameters, callback, errback) => {
+      transport.on('produce', (parameters, callback, errback) => {
         try {
           console.log('Producing with parameters:', parameters);
           socket.emit(
@@ -159,7 +165,7 @@ export const useMediaSoup = () => {
             (response: any) => {
               if (response.error) {
                 console.error('Produce error:', response.error);
-                errback(response.error);
+                errback(new Error(response.error));
               } else {
                 console.log('Producer created with ID:', response.id);
                 callback({ id: response.id });
@@ -168,6 +174,11 @@ export const useMediaSoup = () => {
           );
         } catch (error) {
           console.error('Error in produce:', error);
+          errback(
+            error instanceof Error
+              ? error
+              : new Error('Unknown error in produce')
+          );
         }
       });
 
@@ -287,7 +298,7 @@ export const useMediaSoup = () => {
       );
       consumerTransportRef.current = transport;
 
-      transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+      transport.on('connect', ({ dtlsParameters }, callback, errback) => {
         try {
           socket.emit(
             'connect-transport',
@@ -486,29 +497,14 @@ export const useMediaSoup = () => {
     try {
       // init socket
       await initSocket();
-      const socket = socketRef.current;
+      let socket = socketRef.current;
 
       if (!socket) {
-        throw new Error('Socket Cration Failed');
+        throw new Error('Socket Creation Failed');
       }
-      await initDevice();
-      if (!deviceRef) {
-        throw new Error('Device Creation Failed');
-      }
-      // get router RtpCapabilities
-      await getRouterRtpCapabilities();
-      await createSendTransport();
-      await createReciveTransport();
 
-      socketRef.current?.on('existing-producers', ({ producerIds }) => {
-        console.log(`Received ${producerIds.length} existing producers.`);
-        for (const { producerId, peerId, kind } of producerIds) {
-          consumeStream(producerId, peerId, kind);
-        }
-      });
-
-      // listner for the server boardcast event
-      socketRef.current?.on('new-producer', ({ producerId, peerId, kind }) => {
+      // Set up all socket listeners first
+      socket.on('new-producer', ({ producerId, peerId, kind }) => {
         console.log(
           'New producer available ',
           producerId,
@@ -524,7 +520,6 @@ export const useMediaSoup = () => {
         console.log('Producer closed notification:', producerId);
       });
 
-      // handle peer-left
       socket.on('peer-left', ({ peerId }) => {
         console.log('Peer left:', peerId);
         setRemotePeers((prev) => {
@@ -532,7 +527,6 @@ export const useMediaSoup = () => {
           updated.delete(peerId);
           return updated;
         });
-        // Also clean any lingering consumers for this peer
         setConsumers((prev) => {
           const updated = new Map(prev);
           prev.forEach((data, cid) => {
@@ -545,6 +539,33 @@ export const useMediaSoup = () => {
         });
       });
 
+      // Initialize MediaSoup components in order
+      await initDevice();
+      if (!deviceRef.current) {
+        throw new Error('Device Creation Failed');
+      }
+
+      // Get router capabilities
+      await getRouterRtpCapabilities();
+
+      // Create transports
+      await createSendTransport();
+      const consumerTransport = await createReciveTransport();
+
+      // Wait a brief moment to ensure transport is ready
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      // Only after consumer transport is ready, get existing producers
+      if (consumerTransport) {
+        console.log('Checking for existing producers');
+        socket.emit('get-existing-producers', ({ producerIds }: any) => {
+          console.log('Received existing producers:', producerIds);
+          for (const { producerId, peerId, kind } of producerIds) {
+            consumeStream(producerId, peerId, kind);
+          }
+        });
+      }
+
       setIsInitialized(true);
       console.log('MediaSoup initialization complete');
     } catch (error) {
@@ -552,6 +573,8 @@ export const useMediaSoup = () => {
       setIsInitialized(false);
     }
   };
+
+  // check for any existing producures after connecting
 
   useEffect(() => {
     init();
